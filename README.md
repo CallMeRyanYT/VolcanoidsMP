@@ -50,6 +50,8 @@ Volcanoids runs on Unity's UNet HLAPI. The mod adds its own `NetworkConnection` 
 - **Host:** accepted sockets are handed to `NetworkServer.AddExternalConnection`. That's the same hook the game's Steam P2P connections use.
 - **Joiner:** the socket is wrapped in a `NetworkClient` and given to the game's `NetworkManager` through `UseExternalClient`.
 
+**Works alongside the built-in Steam multiplayer:** the game's Steam networking is left in place. A host can have Steam friends and direct-IP players in the same session. Direct players get connection IDs starting at 1000, so they never take the slots the game hands out to Steam players. When the host kicks someone or ends the session, direct players are disconnected the same way Steam players are.
+
 The game's own message handlers, spawning and world sync run unchanged. Only the transport underneath is different. Socket input/output runs on background threads, and the game thread only queues and drains messages.
 
 ## Testing status / reporting problems

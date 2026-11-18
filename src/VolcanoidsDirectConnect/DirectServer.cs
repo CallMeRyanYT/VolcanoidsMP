@@ -278,13 +278,17 @@ namespace VolcanoidsDirectConnect
             return hasSteam ? p.Hello.SteamId : p.Link.RemoteAddress;
         }
 
+        // Steam players keep using the game's built-in multiplayer at the same time. Their connection
+        // ids are handed out by the game's transport starting at 1, and the HLAPI silently overwrites
+        // whatever sits in that slot. Direct connections therefore live in their own high id range.
+        internal const int FirstDirectConnectionId = 1000;
+
         private static int FindFreeConnectionId()
         {
-            // Id 0 is the host's own local client. Pick the first unused slot after it.
             var list = NetworkServer.connections;
-            for (int i = 1; i < list.Count; i++)
+            for (int i = FirstDirectConnectionId; i < list.Count; i++)
                 if (list[i] == null) return i;
-            return Math.Max(1, list.Count);
+            return Math.Max(FirstDirectConnectionId, list.Count);
         }
 
         private void Cleanup(DirectConnection conn, bool notifyGame)
