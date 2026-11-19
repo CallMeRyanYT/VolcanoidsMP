@@ -1,49 +1,36 @@
-# Compiles the Volcanoids Direct Connect plugin against the game's own DLLs.
-# Uses the C# compiler that ships with Windows (.NET Framework 4.x), so no SDK install is needed.
+# Developer build: compiles the plugin against a Volcanoids install (needs the .NET SDK).
+# Normal players don't need this - setup.bat installs prebuilt\VolcanoidsDirectConnect.dll.
+#
+#   powershell -ExecutionPolicy Bypass -File tools\build.ps1 -GameDir "D:\SteamLibrary\steamapps\common\Volcanoids"
+#   (add -UpdatePrebuilt to also refresh prebuilt\VolcanoidsDirectConnect.dll)
 param(
-    [Parameter(Mandatory = $true)][string]$ManagedDir,   # <game>\Volcanoids_Data\Managed
-    [Parameter(Mandatory = $true)][string]$BepInExCore,  # <game>\BepInEx\core
-    [Parameter(Mandatory = $true)][string]$OutFile
+    [Parameter(Mandatory = $true)][string]$GameDir,
+    [string]$OutFile = '',
+    [switch]$UpdatePrebuilt
 )
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-$srcDir = Join-Path $root 'src\VolcanoidsDirectConnect'
+$proj = Join-Path $root 'src\VolcanoidsDirectConnect\VolcanoidsDirectConnect.csproj'
 
-$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-if (-not (Test-Path $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
-if (-not (Test-Path $csc)) { throw "Could not find csc.exe (.NET Framework 4). It ships with Windows 10/11 - enable '.NET Framework 4.8' in Windows Features." }
-
-$refs = New-Object System.Collections.Generic.List[string]
-$useGameCorlib = Test-Path (Join-Path $ManagedDir 'mscorlib.dll')
-foreach ($n in @('mscorlib.dll', 'System.dll', 'System.Core.dll', 'netstandard.dll')) {
-    $p = Join-Path $ManagedDir $n
-    if ($useGameCorlib -and (Test-Path $p)) { $refs.Add($p) }
+if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    throw 'The .NET SDK is required to build (https://dotnet.microsoft.com/download). Players can use setup.bat without it.'
 }
-foreach ($n in @('UnityEngine.dll', 'UnityEngine.CoreModule.dll', 'UnityEngine.IMGUIModule.dll',
-                 'UnityEngine.InputLegacyModule.dll', 'UnityEngine.UNETModule.dll',
-                 'com.unity.multiplayer-hlapi.Runtime.dll')) {
-    $p = Join-Path $ManagedDir $n
-    if (Test-Path $p) { $refs.Add($p) }
-    elseif ($n -ne 'UnityEngine.InputLegacyModule.dll') { throw "Missing game library: $p  (is this really the Volcanoids folder, and is the game fully installed?)" }
-}
-foreach ($n in @('BepInEx.dll', '0Harmony.dll')) {
-    $p = Join-Path $BepInExCore $n
-    if (Test-Path $p) { $refs.Add($p) }
-    elseif ($n -eq 'BepInEx.dll') { throw "Missing $p - BepInEx is not installed correctly." }
+if (-not (Test-Path (Join-Path $GameDir 'BepInEx\core\BepInEx.dll'))) {
+    throw "BepInEx isn't installed in $GameDir yet - run setup.bat once first."
 }
 
-$cscArgs = New-Object System.Collections.Generic.List[string]
-$cscArgs.AddRange([string[]]@('/nologo', '/target:library', '/optimize+', '/debug-', '/warn:1', '/langversion:5'))
-if ($useGameCorlib) { $cscArgs.Add('/nostdlib+'); $cscArgs.Add('/noconfig') }
-$cscArgs.Add("/out:$OutFile")
-foreach ($r in $refs) { $cscArgs.Add("/reference:$r") }
-Get-ChildItem -Path $srcDir -Filter '*.cs' | ForEach-Object { $cscArgs.Add($_.FullName) }
+$outDir = Join-Path $env:TEMP 'VolcanoidsDirectConnect.build'
+& dotnet build $proj -c Release -nologo "-p:GameDir=$GameDir" -o $outDir
+if ($LASTEXITCODE -ne 0) { throw "Build failed (exit code $LASTEXITCODE)." }
+$dll = Join-Path $outDir 'VolcanoidsDirectConnect.dll'
 
-$outDir = Split-Path -Parent $OutFile
-if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
-
-Write-Host "Compiling with $csc"
-& $csc @cscArgs
-if ($LASTEXITCODE -ne 0) { throw "Compilation failed (exit code $LASTEXITCODE). Copy the errors above and send them to whoever maintains the mod." }
-Write-Host "Built $OutFile"
+if ($OutFile) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutFile) | Out-Null
+    Copy-Item -Force $dll $OutFile
+    Write-Host "Built $OutFile"
+}
+if ($UpdatePrebuilt) {
+    Copy-Item -Force $dll (Join-Path $root 'prebuilt\VolcanoidsDirectConnect.dll')
+    Write-Host 'Updated prebuilt\VolcanoidsDirectConnect.dll'
+}

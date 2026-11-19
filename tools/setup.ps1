@@ -3,6 +3,7 @@
 param(
     [string]$GamePath = '',
     [switch]$Uninstall,
+    [switch]$Build,      # developers: compile against the game instead of using prebuilt\ (needs .NET SDK)
     [switch]$NoPause
 )
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,7 @@ $BepSha256    = '6c57a714a892efb4e9e1fef63d608a3391f30ec984031c465404e4ee381a075
 $DefaultPort  = 27777
 $FirewallRule = 'Volcanoids Direct Connect'
 $ModGuid      = 'com.volcanoidsmp.directconnect'
+$TargetGameVersion = '1.33.506.0'
 $Root         = Split-Path -Parent $PSScriptRoot
 $SavedPathFile = Join-Path $Root 'gamepath.txt'   # remembers the folder you picked (not committed)
 
@@ -204,78 +206,61 @@ function Enable-Doorstop([string]$game) {
     }
 }
 
-# Writes the mod's settings file now, so the game is ready on first launch and
-# the user can set port/password before ever starting it. Existing values are kept.
-function Write-ModConfig([string]$game, [int]$port, [string]$password, [string]$playerName) {
+# Writes the mod's settings file now, so the game is ready on first launch.
+# Re-runs keep the file and only change what setup asked about. Files from mod 0.1 are replaced.
+function Write-ModConfig([string]$game, [int]$port, [bool]$useSteam) {
     $cfgDir = Join-Path $game 'BepInEx\config'
     New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
     $cfg = Join-Path $cfgDir "$ModGuid.cfg"
+    $steamValue = if ($useSteam) { 'true' } else { 'false' }
     if (Test-Path $cfg) {
         $txt = Get-Content -LiteralPath $cfg -Raw
-        $txt = Set-CfgValue $txt 'Port' ([string]$port)
-        $txt = Set-CfgValue $txt 'Password' (ConvertTo-CfgString $password)
-        $txt = Set-CfgValue $txt 'PlayerName' (ConvertTo-CfgString $playerName)
-        Set-Content -LiteralPath $cfg -Value $txt -Encoding UTF8 -NoNewline
-        Write-Ok "Updated settings: $cfg"
-        return
+        if ($txt -match '(?m)^UseSteamTransport = ') {
+            $txt = Set-CfgValue $txt 'Port' ([string]$port)
+            $txt = Set-CfgValue $txt 'UseSteamTransport' $steamValue
+            Set-Content -LiteralPath $cfg -Value $txt -Encoding UTF8 -NoNewline
+            Write-Ok "Updated settings: $cfg"
+            return
+        }
+        Write-Ok 'Replacing settings from the previous mod version.'
     }
     $content = @"
 ## Settings file was created by Volcanoids Direct Connect setup
-## You can edit it with Notepad. The game must be closed while you edit.
+## You can edit it with Notepad while the game is closed, or just run setup.bat again.
 
 [Advanced]
 
-## Number of UNet channels on direct connections. Raise it if the log says a channel id is out of range.
-# Setting type: Int32
-# Default value: 16
-ChannelCount = 16
-
-## What the game sees as a direct player's connection address. Auto = the joiner's SteamID64 when available, otherwise ip:port. SteamId = always SteamID64 (or 0). IpPort = always ip:port.
-# Setting type: String
-# Default value: Auto
-ConnectionAddressMode = Auto
-
-## Log every connection event in detail.
+## Log more detail about connections.
 # Setting type: Boolean
 # Default value: false
 VerboseLogging = false
 
 [Network]
 
-## TCP port the host listens on. Joiners must use the same port. Open/forward this port if you are not using a VPN like Tailscale.
+## TCP port the host listens on. Joiners type host-ip:port. Open/forward it if you aren't using a VPN like Tailscale.
 # Setting type: Int32
 # Default value: 27777
 Port = $port
 
-## Automatically accept direct IP players as soon as you are hosting a game.
+## When you host a multiplayer game, also accept players who join by IP.
 # Setting type: Boolean
 # Default value: true
-AutoOpenWhenHosting = true
+AcceptDirectPlayers = true
 
-## Optional password. Host and joiners must use the same value. Empty = no password.
-# Setting type: String
-# Default value:
-Password = $(ConvertTo-CfgString $password)
+## true = Steam multiplayer keeps working alongside direct IP (when Steam is running). false = DIRECT ONLY: Steam's networking is not used at all, only direct IP connections (for testing).
+# Setting type: Boolean
+# Default value: true
+UseSteamTransport = $steamValue
 
-## Max number of players that may join through direct IP at the same time.
+## Drop a direct connection after this many seconds without any data.
 # Setting type: Int32
-# Default value: 3
-MaxDirectPlayers = 3
-
-## Reject joiners whose game version differs from the host's (strongly recommended).
-# Setting type: Boolean
-# Default value: true
-RequireSameGameVersion = true
+# Default value: 30
+TimeoutSeconds = 30
 
 ## Last address you joined (filled in automatically).
 # Setting type: String
 # Default value: 100.64.0.1:27777
 LastAddress = 100.64.0.1:$port
-
-## Name shown to the host in logs. Empty = Windows user name.
-# Setting type: String
-# Default value:
-PlayerName = $(ConvertTo-CfgString $playerName)
 
 [UI]
 
@@ -284,7 +269,7 @@ PlayerName = $(ConvertTo-CfgString $playerName)
 # Default value: F8
 ToggleKey = F8
 
-## Key that writes a networking diagnostics report (send this file to whoever maintains the mod).
+## Key that writes a networking diagnostics report.
 # Setting type: KeyCode
 # Default value: F9
 DiagnosticsKey = F9
@@ -418,27 +403,24 @@ try {
     Enable-Doorstop $GamePath
     Set-BepInExConsole $GamePath
 
-    # ---------------------------------------------------------------- 3. build + install mod
-    Write-Step 'Step 3/6 - Building the mod against your copy of the game'
-    $tmpDll = Join-Path $env:TEMP "$ModName.build.dll"
-    $built = $false
-    try {
-        & (Join-Path $PSScriptRoot 'build.ps1') -ManagedDir (Join-Path $GamePath 'Volcanoids_Data\Managed') `
-            -BepInExCore (Join-Path $GamePath 'BepInEx\core') -OutFile $tmpDll
-        $built = $true
-    } catch {
-        Write-Warn2 "Build against the game failed: $($_.Exception.Message)"
+    # ---------------------------------------------------------------- 3. install mod
+    Write-Step 'Step 3/6 - Installing the Direct Connect mod'
+    $versionFile = Join-Path $GamePath 'version.txt'
+    if (Test-Path $versionFile) {
+        $gameVersion = ((Get-Content -LiteralPath $versionFile -TotalCount 1) -as [string]).Trim()
+        if ($gameVersion -eq $TargetGameVersion) { Write-Ok "Game version $gameVersion - matches the mod." }
+        else { Write-Warn2 "Game version is '$gameVersion' but this mod was built for $TargetGameVersion. It may not load." }
     }
+    $prebuilt = Join-Path $Root "prebuilt\$ModName.dll"
     New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
-    if ($built) {
-        Copy-Item -Force $tmpDll $outDll
-        Remove-Item -Force $tmpDll -ErrorAction SilentlyContinue
-        Write-Ok "Installed $outDll"
+    if ($Build) {
+        # Developer option: compile against this game folder (needs the .NET SDK).
+        & (Join-Path $PSScriptRoot 'build.ps1') -GameDir $GamePath -OutFile $outDll
+        Write-Ok "Built and installed $outDll"
     } else {
-        $prebuilt = Join-Path $Root "prebuilt\$ModName.dll"
-        if (-not (Test-Path $prebuilt)) { throw 'Build failed and no prebuilt DLL is available.' }
+        if (-not (Test-Path $prebuilt)) { throw "Missing $prebuilt - download the full mod again." }
         Copy-Item -Force $prebuilt $outDll
-        Write-Warn2 "Installed the PREBUILT dll instead (may not match your game version exactly)."
+        Write-Ok "Installed $outDll"
     }
 
     # ---------------------------------------------------------------- 4. settings
@@ -448,21 +430,18 @@ try {
     if ($existingPort -match '^\d+$') { $port = [int]$existingPort }
     $port = Read-Port $port
 
-    $password = Get-ExistingSetting $GamePath 'Password'
-    if ($null -eq $password) { $password = '' }
-    $pwState = 'none'
-    if ($password.Length -gt 0) { $pwState = 'one is set' }
-    Write-Host "    Optional password - host and friends must type the same one (currently: $pwState)."
-    $pwAnswer = Read-Host '    Password [ENTER = keep, - = remove]'
-    if ($pwAnswer -eq '-') { $password = '' }
-    elseif (-not [string]::IsNullOrEmpty($pwAnswer)) { $password = $pwAnswer }
+    $useSteam = $true
+    if ((Get-ExistingSetting $GamePath 'UseSteamTransport') -eq 'false') { $useSteam = $false }
+    $current = if ($useSteam) { 'Steam + direct IP' } else { 'DIRECT IP ONLY' }
+    Write-Host "    Network mode (currently: $current)"
+    Write-Host '      1 = Steam + direct IP  (normal: Steam friends and IP players can both join)'
+    Write-Host '      2 = Direct IP only     (testing: Steam multiplayer is not used at all)'
+    $modeAnswer = Read-Host '    Mode [ENTER = keep]'
+    if ($modeAnswer -match '^\s*1\s*$') { $useSteam = $true }
+    elseif ($modeAnswer -match '^\s*2\s*$') { $useSteam = $false }
 
-    $playerName = Get-ExistingSetting $GamePath 'PlayerName'
-    if ([string]::IsNullOrEmpty($playerName)) { $playerName = $env:USERNAME }
-    $nameAnswer = Read-Host "    Your name shown to the host [ENTER = $playerName]"
-    if (-not [string]::IsNullOrWhiteSpace($nameAnswer)) { $playerName = $nameAnswer.Trim() }
-
-    Write-ModConfig $GamePath $port $password $playerName
+    Write-ModConfig $GamePath $port $useSteam
+    Write-Host '    Game passwords are set in Volcanoids itself (multiplayer settings) - joiners type it in the F8 window.'
 
     # ---------------------------------------------------------------- 5. firewall
     Write-Step 'Step 5/6 - Windows Firewall (only needed on the computer that HOSTS)'
@@ -483,11 +462,14 @@ try {
 
     1. Both install Tailscale (https://tailscale.com) and log in to the SAME tailnet
        (or use ZeroTier / Radmin VPN / same LAN / port-forward TCP $port).
-    2. HOST: start Volcanoids from Steam as usual and load your save as a co-op /
-       multiplayer game. Press F8 to see the address to give your friend
+    2. HOST: start Volcanoids and load (or create) a save with MULTIPLAYER turned ON
+       in the save's settings. Press F8 to see the address to give your friend
        (the 100.x.x.x one is your Tailscale IP).
     3. FRIEND: start Volcanoids, stay on the MAIN MENU, press F8,
        type the host address (e.g. 100.101.102.103:$port) and click Join.
+       If the host set a game password, type it in the F8 window too.
+
+    Testing on ONE PC: run the game twice and join 127.0.0.1:$port.
 
     F8 = Direct Connect window    F9 = write a diagnostics report
     Settings:    $GamePath\BepInEx\config\$ModGuid.cfg

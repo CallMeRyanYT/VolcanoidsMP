@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -22,8 +23,11 @@ namespace VolcanoidsDirectConnect
     /// </summary>
     internal sealed class TcpLink
     {
-        public const int MaxFrameSize = 1024 * 1024;
-        private const int MaxQueuedSends = 20000;
+        public const int MaxFrameSize = 2 * 1024 * 1024;
+        public const byte ControlChannel = 255;
+        private const int MaxQueuedSends = 50000;
+
+        private static readonly Stopwatch Clock = Stopwatch.StartNew();
 
         private readonly TcpClient client;
         private readonly NetworkStream stream;
@@ -32,34 +36,43 @@ namespace VolcanoidsDirectConnect
         private readonly object inboxLock = new object();
         private readonly Queue<Frame> inbox = new Queue<Frame>();
         private volatile bool closed;
+        private bool closeWhenDrained;
         private string closeReason = "";
         private long bytesIn;
         private long bytesOut;
+        private long lastReceiveMs;
 
         public readonly string RemoteAddress;
+        public readonly IPAddress RemoteIp;
 
         public TcpLink(TcpClient client)
         {
             this.client = client;
             client.NoDelay = true;
-            client.ReceiveBufferSize = 256 * 1024;
-            client.SendBufferSize = 256 * 1024;
+            client.ReceiveBufferSize = 512 * 1024;
+            client.SendBufferSize = 512 * 1024;
             try { client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true); }
             catch (Exception) { }
             stream = client.GetStream();
-            RemoteAddress = DescribeEndPoint(client.Client.RemoteEndPoint);
+            IPEndPoint ep = client.Client.RemoteEndPoint as IPEndPoint;
+            RemoteIp = ep == null ? IPAddress.None : (ep.Address.IsIPv4MappedToIPv6 ? ep.Address.MapToIPv4() : ep.Address);
+            RemoteAddress = DescribeEndPoint(ep);
+            lastReceiveMs = NowMs;
         }
+
+        public static long NowMs { get { return Clock.ElapsedMilliseconds; } }
 
         public NetworkStream Stream { get { return stream; } }
         public bool IsClosed { get { return closed; } }
         public string CloseReason { get { return closeReason; } }
         public long BytesIn { get { return Interlocked.Read(ref bytesIn); } }
         public long BytesOut { get { return Interlocked.Read(ref bytesOut); } }
+        public long MsSinceLastReceive { get { return NowMs - Interlocked.Read(ref lastReceiveMs); } }
+        public int PendingCount { get { lock (inboxLock) { return inbox.Count; } } }
 
-        public static string DescribeEndPoint(EndPoint ep)
+        public static string DescribeEndPoint(IPEndPoint ip)
         {
-            IPEndPoint ip = ep as IPEndPoint;
-            if (ip == null) return ep == null ? "?" : ep.ToString();
+            if (ip == null) return "?";
             IPAddress addr = ip.Address;
             if (addr.IsIPv4MappedToIPv6) addr = addr.MapToIPv4();
             if (addr.AddressFamily == AddressFamily.InterNetworkV6) return "[" + addr + "]:" + ip.Port;
@@ -71,29 +84,41 @@ namespace VolcanoidsDirectConnect
         {
             client.ReceiveTimeout = 0;
             client.SendTimeout = 0;
-            Thread reader = new Thread(ReadLoop);
-            reader.IsBackground = true;
-            reader.Name = "VDC reader " + RemoteAddress;
+            lastReceiveMs = NowMs;
+            Thread reader = new Thread(ReadLoop) { IsBackground = true, Name = "VDC reader " + RemoteAddress };
             reader.Start();
-            Thread writer = new Thread(WriteLoop);
-            writer.IsBackground = true;
-            writer.Name = "VDC writer " + RemoteAddress;
+            Thread writer = new Thread(WriteLoop) { IsBackground = true, Name = "VDC writer " + RemoteAddress };
             writer.Start();
         }
 
-        public void Send(byte[] data, int count, int channel)
+        public void Send(ReadOnlySpan<byte> data, int channel)
         {
-            byte[] frame = new byte[5 + count];
-            WriteInt32(frame, 0, count + 1);
+            byte[] frame = new byte[5 + data.Length];
+            WriteInt32(frame, 0, data.Length + 1);
             frame[4] = (byte)channel;
-            Buffer.BlockCopy(data, 0, frame, 5, count);
+            data.CopyTo(new Span<byte>(frame, 5, data.Length));
+            Enqueue(frame);
+        }
+
+        public void SendControl(byte type, ReadOnlySpan<byte> payload)
+        {
+            byte[] frame = new byte[6 + payload.Length];
+            WriteInt32(frame, 0, payload.Length + 2);
+            frame[4] = ControlChannel;
+            frame[5] = type;
+            payload.CopyTo(new Span<byte>(frame, 6, payload.Length));
+            Enqueue(frame);
+        }
+
+        private void Enqueue(byte[] frame)
+        {
             lock (sendLock)
             {
-                if (closed) return;
+                if (closed || closeWhenDrained) return;
                 if (sendQueue.Count >= MaxQueuedSends)
                 {
                     // The peer stopped reading; drop it rather than eating all memory.
-                    CloseInternal("send queue overflow (peer not reading)");
+                    CloseInternal("send queue overflow (peer stopped reading)");
                     return;
                 }
                 sendQueue.Enqueue(frame);
@@ -115,16 +140,31 @@ namespace VolcanoidsDirectConnect
             return false;
         }
 
+        /// <summary>Closes immediately, dropping anything not yet sent.</summary>
         public void Close(string reason)
         {
             lock (sendLock) { CloseInternal(reason); }
+        }
+
+        /// <summary>Sends everything already queued (e.g. a goodbye message), then closes.</summary>
+        public void CloseAfterFlush(string reason)
+        {
+            lock (sendLock)
+            {
+                if (closed) return;
+                closeReason = reason;
+                closeWhenDrained = true;
+                Monitor.PulseAll(sendLock);
+            }
+            // Safety net in case the peer never reads.
+            ThreadPool.QueueUserWorkItem(delegate { Thread.Sleep(3000); Close(reason); });
         }
 
         // Caller must hold sendLock.
         private void CloseInternal(string reason)
         {
             if (closed) return;
-            closeReason = reason;
+            if (!closeWhenDrained || string.IsNullOrEmpty(closeReason)) closeReason = reason;
             closed = true;
             Monitor.PulseAll(sendLock);
             try { client.Close(); } catch (Exception) { }
@@ -137,12 +177,13 @@ namespace VolcanoidsDirectConnect
             {
                 while (!closed)
                 {
-                    if (!ReadExact(stream, header, 4)) { Close("connection closed by remote"); return; }
+                    if (!ReadExact(stream, header, 4)) { Close("connection closed by the other side"); return; }
                     int len = ReadInt32(header, 0);
                     if (len < 1 || len > MaxFrameSize) { Close("invalid frame length " + len); return; }
                     byte[] body = new byte[len];
-                    if (!ReadExact(stream, body, len)) { Close("connection closed by remote"); return; }
+                    if (!ReadExact(stream, body, len)) { Close("connection closed by the other side"); return; }
                     Interlocked.Add(ref bytesIn, len + 4);
+                    Interlocked.Exchange(ref lastReceiveMs, NowMs);
 
                     Frame f;
                     f.Channel = body[0];
@@ -164,11 +205,13 @@ namespace VolcanoidsDirectConnect
             {
                 while (true)
                 {
+                    bool drainedAndClosing;
                     lock (sendLock)
                     {
-                        while (sendQueue.Count == 0 && !closed) Monitor.Wait(sendLock);
+                        while (sendQueue.Count == 0 && !closed && !closeWhenDrained) Monitor.Wait(sendLock);
                         if (closed) return;
                         while (sendQueue.Count > 0) batch.Add(sendQueue.Dequeue());
+                        drainedAndClosing = closeWhenDrained;
                     }
                     for (int i = 0; i < batch.Count; i++)
                     {
@@ -177,6 +220,19 @@ namespace VolcanoidsDirectConnect
                     }
                     stream.Flush();
                     batch.Clear();
+                    if (drainedAndClosing)
+                    {
+                        lock (sendLock)
+                        {
+                            if (sendQueue.Count == 0)
+                            {
+                                try { client.Client.Shutdown(SocketShutdown.Send); } catch (Exception) { }
+                                Thread.Sleep(100);
+                                CloseInternal(closeReason);
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             catch (Exception e)
@@ -214,23 +270,34 @@ namespace VolcanoidsDirectConnect
     /// <summary>The small hello exchanged before any game traffic.</summary>
     internal static class Handshake
     {
-        public const uint Magic = 0x31434456; // "VDC1"
+        public const uint Magic = 0x32434456; // "VDC2"
+
+        public const byte ModeProbe = 0;  // "what are you running?" - used before loading the host's world
+        public const byte ModeJoin = 1;   // real game connection
 
         public const byte ResultOk = 0;
-        public const byte ResultBadPassword = 1;
         public const byte ResultVersionMismatch = 2;
         public const byte ResultNotHosting = 3;
-        public const byte ResultFull = 4;
         public const byte ResultProtocolMismatch = 5;
 
         internal sealed class Hello
         {
             public int Protocol;
+            public byte Mode;
             public string ModVersion = "";
             public string GameVersion = "";
-            public string Password = "";
             public string PlayerName = "";
-            public string SteamId = "";
+            public ulong SteamId;
+        }
+
+        internal sealed class Reply
+        {
+            public byte Result = 255;
+            public string Message = "no reply from host";
+            public string HostGameVersion = "";
+            public string SceneName = "";
+            public bool PasswordRequired;
+            public string HostName = "";
         }
 
         public static void WriteHello(Stream s, Hello h)
@@ -239,11 +306,11 @@ namespace VolcanoidsDirectConnect
             BinaryWriter w = new BinaryWriter(ms, Encoding.UTF8);
             w.Write(Magic);
             w.Write(h.Protocol);
+            w.Write(h.Mode);
             w.Write(h.ModVersion ?? "");
             w.Write(h.GameVersion ?? "");
-            w.Write(h.Password ?? "");
             w.Write(h.PlayerName ?? "");
-            w.Write(h.SteamId ?? "");
+            w.Write(h.SteamId);
             w.Flush();
             WriteBlock(s, ms.ToArray());
         }
@@ -256,39 +323,47 @@ namespace VolcanoidsDirectConnect
             if (r.ReadUInt32() != Magic) return null;
             Hello h = new Hello();
             h.Protocol = r.ReadInt32();
+            h.Mode = r.ReadByte();
             h.ModVersion = r.ReadString();
             h.GameVersion = r.ReadString();
-            h.Password = r.ReadString();
             h.PlayerName = r.ReadString();
-            h.SteamId = r.ReadString();
+            h.SteamId = r.ReadUInt64();
             return h;
         }
 
-        public static void WriteReply(Stream s, byte result, string message, string hostGameVersion)
+        public static void WriteReply(Stream s, Reply rep)
         {
             MemoryStream ms = new MemoryStream();
             BinaryWriter w = new BinaryWriter(ms, Encoding.UTF8);
             w.Write(Magic);
-            w.Write(result);
-            w.Write(message ?? "");
-            w.Write(hostGameVersion ?? "");
+            w.Write(rep.Result);
+            w.Write(rep.Message ?? "");
+            w.Write(rep.HostGameVersion ?? "");
+            w.Write(rep.SceneName ?? "");
+            w.Write(rep.PasswordRequired);
+            w.Write(rep.HostName ?? "");
             w.Flush();
             WriteBlock(s, ms.ToArray());
         }
 
-        public static bool ReadReply(Stream s, out byte result, out string message, out string hostGameVersion)
+        public static Reply ReadReply(Stream s)
         {
-            result = 255;
-            message = "no reply from host";
-            hostGameVersion = "";
+            Reply rep = new Reply();
             byte[] block = ReadBlock(s);
-            if (block == null) return false;
+            if (block == null) return rep;
             BinaryReader r = new BinaryReader(new MemoryStream(block), Encoding.UTF8);
-            if (r.ReadUInt32() != Magic) { message = "host is not running Volcanoids Direct Connect"; return false; }
-            result = r.ReadByte();
-            message = r.ReadString();
-            hostGameVersion = r.ReadString();
-            return true;
+            if (r.ReadUInt32() != Magic)
+            {
+                rep.Message = "the host is not running the same Volcanoids Direct Connect version";
+                return rep;
+            }
+            rep.Result = r.ReadByte();
+            rep.Message = r.ReadString();
+            rep.HostGameVersion = r.ReadString();
+            rep.SceneName = r.ReadString();
+            rep.PasswordRequired = r.ReadBoolean();
+            rep.HostName = r.ReadString();
+            return rep;
         }
 
         private static void WriteBlock(Stream s, byte[] data)
