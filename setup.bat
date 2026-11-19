@@ -2,9 +2,11 @@
 setlocal
 title Volcanoids Direct Connect - setup
 rem Usage:
-rem   setup.bat                       install / update the mod (finds the game automatically)
-rem   setup.bat "D:\Games\Volcanoids"  install into a specific game folder
-rem   setup.bat uninstall             remove the mod
+rem   setup.bat                        asks where Volcanoids is installed (suggests the folder it finds),
+rem                                    installs BepInEx + the mod and makes the game ready to play
+rem   setup.bat "D:\Games\Volcanoids"  same, but uses this folder (you can also drag the game
+rem                                    folder onto setup.bat)
+rem   setup.bat uninstall              remove the mod
 
 set "ARGS="
 if /I "%~1"=="uninstall" (

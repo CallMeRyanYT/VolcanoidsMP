@@ -14,7 +14,17 @@ $BepUrl       = "https://github.com/BepInEx/BepInEx/releases/download/v$BepVersi
 $BepSha256    = '6c57a714a892efb4e9e1fef63d608a3391f30ec984031c465404e4ee381a0755'
 $DefaultPort  = 27777
 $FirewallRule = 'Volcanoids Direct Connect'
+$ModGuid      = 'com.volcanoidsmp.directconnect'
 $Root         = Split-Path -Parent $PSScriptRoot
+$SavedPathFile = Join-Path $Root 'gamepath.txt'   # remembers the folder you picked (not committed)
+
+# BepInEx config strings escape backslashes and quotes.
+function ConvertTo-CfgString([string]$s) { if ($null -eq $s) { return '' }; return $s.Replace('\', '\\').Replace('"', '\"') }
+function ConvertFrom-CfgString([string]$s) { if ($null -eq $s) { return '' }; return $s.Replace('\"', '"').Replace('\\', '\') }
+function Set-CfgValue([string]$txt, [string]$key, [string]$value) {
+    $line = "$key = $value"
+    return [regex]::Replace($txt, "(?m)^$([regex]::Escape($key)) = [^\r\n]*", [System.Text.RegularExpressions.MatchEvaluator] { param($m) $line })
+}
 
 function Write-Step($msg) { Write-Host ''; Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "    $msg" -ForegroundColor Green }
@@ -22,7 +32,11 @@ function Write-Warn2($msg){ Write-Host "    $msg" -ForegroundColor Yellow }
 
 function Test-GameDir([string]$dir) {
     if ([string]::IsNullOrWhiteSpace($dir)) { return $false }
-    return (Test-Path (Join-Path $dir 'Volcanoids.exe')) -and (Test-Path (Join-Path $dir 'Volcanoids_Data\Managed'))
+    # Plain .NET calls: Join-Path/Test-Path throw for drives that don't exist (old Steam libraries, USB disks).
+    try {
+        return [System.IO.File]::Exists([System.IO.Path]::Combine($dir, 'Volcanoids.exe')) -and
+               [System.IO.Directory]::Exists([System.IO.Path]::Combine($dir, 'Volcanoids_Data', 'Managed'))
+    } catch { return $false }
 }
 
 function Get-SteamLibraries {
@@ -37,7 +51,7 @@ function Get-SteamLibraries {
     }
     $steamRoots += @("${env:ProgramFiles(x86)}\Steam", "$env:ProgramFiles\Steam")
     foreach ($sr in ($steamRoots | Select-Object -Unique)) {
-        if (-not (Test-Path $sr)) { continue }
+        if (-not [System.IO.Directory]::Exists($sr)) { continue }
         $libs.Add($sr)
         $vdf = Join-Path $sr 'steamapps\libraryfolders.vdf'
         if (Test-Path $vdf) {
@@ -58,15 +72,254 @@ function Get-SteamLibraries {
 
 function Find-Game {
     foreach ($lib in Get-SteamLibraries) {
-        $dir = Join-Path $lib 'steamapps\common\Volcanoids'
-        if (Test-GameDir $dir) { return (Resolve-Path $dir).Path }
+        $dir = [System.IO.Path]::Combine($lib, 'steamapps', 'common', 'Volcanoids')
+        if (Test-GameDir $dir) { return [System.IO.Path]::GetFullPath($dir) }
     }
+    return $null
+}
+
+# Turns whatever the user typed/pasted/dragged into the real game folder, if possible.
+# Accepts: the game folder, Volcanoids.exe, Volcanoids_Data, a Steam library folder,
+# or a steamapps / steamapps\common folder.
+function Resolve-GameDir([string]$text) {
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $p = $text.Trim().Trim('"').Trim("'").Trim()
+    $p = [Environment]::ExpandEnvironmentVariables($p)
+    if ($p.Length -eq 2 -and $p[1] -eq ':') { $p += '\' }
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { return $null }
+
+    try {
+        if ([System.IO.File]::Exists($p)) { $p = [System.IO.Path]::GetDirectoryName($p) }   # e.g. ...\Volcanoids.exe
+        $p = $p.TrimEnd([char]'\', [char]'/')
+        if ($p.Length -eq 2 -and $p[1] -eq ':') { $p += '\' }
+        if ([System.IO.Path]::GetFileName($p) -ieq 'Volcanoids_Data') { $p = [System.IO.Path]::GetDirectoryName($p) }
+        $candidates = @(
+            $p,
+            [System.IO.Path]::Combine($p, 'Volcanoids'),
+            [System.IO.Path]::Combine($p, 'common', 'Volcanoids'),
+            [System.IO.Path]::Combine($p, 'steamapps', 'common', 'Volcanoids')
+        )
+        foreach ($c in $candidates) {
+            if (Test-GameDir $c) { return [System.IO.Path]::GetFullPath($c).TrimEnd([char]'\') }
+        }
+    } catch { }
+    return $null
+}
+
+function Read-SavedGamePath {
+    try { if (Test-Path $SavedPathFile) { return (Get-Content -LiteralPath $SavedPathFile -Raw).Trim() } } catch { }
+    return $null
+}
+
+function Save-GamePath([string]$dir) {
+    try { Set-Content -LiteralPath $SavedPathFile -Value $dir -Encoding UTF8 } catch { }
+}
+
+function Select-GameDir([string]$fromArgs) {
+    # 1. A folder given on the command line (or dragged onto setup.bat) wins.
+    if (-not [string]::IsNullOrWhiteSpace($fromArgs)) {
+        $dir = Resolve-GameDir $fromArgs
+        if ($dir) { return $dir }
+        Write-Warn2 "That folder doesn't contain Volcanoids: $fromArgs"
+    }
+
+    # 2. Suggest the folder used last time, else the one found in Steam.
+    $suggest = Resolve-GameDir (Read-SavedGamePath)
+    $how = 'used last time'
+    if (-not $suggest) { $suggest = Find-Game; $how = 'found in your Steam library' }
+
+    $emptyAnswers = 0
+    while ($true) {
+        Write-Host ''
+        if ($suggest) {
+            Write-Host "    Game folder ($how):" -NoNewline
+            Write-Host " $suggest" -ForegroundColor White
+            Write-Host '    Press ENTER to use it, or type/paste a different folder.'
+        } else {
+            Write-Warn2 'Could not find Volcanoids automatically.'
+            Write-Host  '    Type or paste the folder Volcanoids is installed in.'
+            Write-Host  '    Tip: Steam > right-click Volcanoids > Manage > Browse local files, then copy the address bar.'
+            Write-Host  '    You can also drag the folder into this window.'
+        }
+        Write-Host '    (Type Q to quit.)'
+        $answer = Read-Host '    Game folder'
+        if ($answer -match '^\s*[qQ]\s*$') { throw 'Setup cancelled.' }
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            if ($suggest) { return $suggest }
+            # Stops an endless loop when there's no keyboard (e.g. input piped in) or the user keeps pressing ENTER.
+            if (++$emptyAnswers -ge 3) { throw 'No game folder given. Run setup.bat again and type the folder that contains Volcanoids.exe.' }
+            continue
+        }
+        $emptyAnswers = 0
+        $dir = Resolve-GameDir $answer
+        if ($dir) { return $dir }
+        Write-Warn2 "Volcanoids.exe was not found in: $($answer.Trim().Trim('`"'))"
+        Write-Warn2 'Pick the folder that contains Volcanoids.exe and the Volcanoids_Data folder.'
+    }
+}
+
+function Get-SteamAppId([string]$game) {
+    # steamapps\common\Volcanoids -> steamapps\appmanifest_<id>.acf
+    try {
+        $steamapps = Split-Path -Parent (Split-Path -Parent $game)
+        foreach ($acf in Get-ChildItem -LiteralPath $steamapps -Filter 'appmanifest_*.acf' -ErrorAction Stop) {
+            $txt = Get-Content -LiteralPath $acf.FullName -Raw
+            if ($txt -match '"installdir"\s+"Volcanoids"' -and $txt -match '"appid"\s+"(\d+)"') { return $Matches[1] }
+        }
+    } catch { }
+    return $null
+}
+
+# Final check that everything the game needs to load the mod is in place.
+function Test-Ready([string]$game, [string]$pluginDll) {
+    $ok = $true
+    $checks = @(
+        @('BepInEx loader (winhttp.dll)',        (Test-Path (Join-Path $game 'winhttp.dll'))),
+        @('BepInEx loader config',               (Test-Path (Join-Path $game 'doorstop_config.ini'))),
+        @('BepInEx core',                        (Test-Path (Join-Path $game 'BepInEx\core\BepInEx.dll'))),
+        @('Direct Connect mod',                  (Test-Path $pluginDll)),
+        @('Direct Connect settings',             (Test-Path (Join-Path $game "BepInEx\config\$ModGuid.cfg")))
+    )
+    $ini = Join-Path $game 'doorstop_config.ini'
+    if (Test-Path $ini) {
+        $enabled = -not ((Get-Content -LiteralPath $ini -Raw) -match '(?mi)^\s*enabled\s*=\s*false')
+        $checks += ,@('BepInEx loader enabled', $enabled)
+    }
+    foreach ($c in $checks) {
+        if ($c[1]) { Write-Host "    [OK]      $($c[0])" -ForegroundColor Green }
+        else       { Write-Host "    [MISSING] $($c[0])" -ForegroundColor Red; $ok = $false }
+    }
+    return $ok
+}
+
+function Enable-Doorstop([string]$game) {
+    $ini = Join-Path $game 'doorstop_config.ini'
+    if (-not (Test-Path $ini)) { return }
+    $txt = Get-Content -LiteralPath $ini -Raw
+    if ($txt -match '(?mi)^\s*enabled\s*=\s*false') {
+        $txt = [regex]::Replace($txt, '(?mi)^(\s*enabled\s*=\s*)false', '${1}true')
+        Set-Content -LiteralPath $ini -Value $txt -Encoding ASCII
+        Write-Ok 'Re-enabled the BepInEx loader (it was switched off).'
+    }
+}
+
+# Writes the mod's settings file now, so the game is ready on first launch and
+# the user can set port/password before ever starting it. Existing values are kept.
+function Write-ModConfig([string]$game, [int]$port, [string]$password, [string]$playerName) {
+    $cfgDir = Join-Path $game 'BepInEx\config'
+    New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+    $cfg = Join-Path $cfgDir "$ModGuid.cfg"
+    if (Test-Path $cfg) {
+        $txt = Get-Content -LiteralPath $cfg -Raw
+        $txt = Set-CfgValue $txt 'Port' ([string]$port)
+        $txt = Set-CfgValue $txt 'Password' (ConvertTo-CfgString $password)
+        $txt = Set-CfgValue $txt 'PlayerName' (ConvertTo-CfgString $playerName)
+        Set-Content -LiteralPath $cfg -Value $txt -Encoding UTF8 -NoNewline
+        Write-Ok "Updated settings: $cfg"
+        return
+    }
+    $content = @"
+## Settings file was created by Volcanoids Direct Connect setup
+## You can edit it with Notepad. The game must be closed while you edit.
+
+[Advanced]
+
+## Number of UNet channels on direct connections. Raise it if the log says a channel id is out of range.
+# Setting type: Int32
+# Default value: 16
+ChannelCount = 16
+
+## What the game sees as a direct player's connection address. Auto = the joiner's SteamID64 when available, otherwise ip:port. SteamId = always SteamID64 (or 0). IpPort = always ip:port.
+# Setting type: String
+# Default value: Auto
+ConnectionAddressMode = Auto
+
+## Log every connection event in detail.
+# Setting type: Boolean
+# Default value: false
+VerboseLogging = false
+
+[Network]
+
+## TCP port the host listens on. Joiners must use the same port. Open/forward this port if you are not using a VPN like Tailscale.
+# Setting type: Int32
+# Default value: 27777
+Port = $port
+
+## Automatically accept direct IP players as soon as you are hosting a game.
+# Setting type: Boolean
+# Default value: true
+AutoOpenWhenHosting = true
+
+## Optional password. Host and joiners must use the same value. Empty = no password.
+# Setting type: String
+# Default value:
+Password = $(ConvertTo-CfgString $password)
+
+## Max number of players that may join through direct IP at the same time.
+# Setting type: Int32
+# Default value: 3
+MaxDirectPlayers = 3
+
+## Reject joiners whose game version differs from the host's (strongly recommended).
+# Setting type: Boolean
+# Default value: true
+RequireSameGameVersion = true
+
+## Last address you joined (filled in automatically).
+# Setting type: String
+# Default value: 100.64.0.1:27777
+LastAddress = 100.64.0.1:$port
+
+## Name shown to the host in logs. Empty = Windows user name.
+# Setting type: String
+# Default value:
+PlayerName = $(ConvertTo-CfgString $playerName)
+
+[UI]
+
+## Key that opens/closes the Direct Connect window.
+# Setting type: KeyCode
+# Default value: F8
+ToggleKey = F8
+
+## Key that writes a networking diagnostics report (send this file to whoever maintains the mod).
+# Setting type: KeyCode
+# Default value: F9
+DiagnosticsKey = F9
+
+## Open the Direct Connect window automatically on the main menu.
+# Setting type: Boolean
+# Default value: true
+ShowWindowOnMainMenu = true
+
+"@
+    Set-Content -LiteralPath $cfg -Value $content -Encoding UTF8
+    Write-Ok "Created settings: $cfg"
+}
+
+function Read-Port([int]$current) {
+    while ($true) {
+        $a = Read-Host "    Port for direct connections [ENTER = $current]"
+        if ([string]::IsNullOrWhiteSpace($a)) { return $current }
+        $n = 0
+        if ([int]::TryParse($a.Trim(), [ref]$n) -and $n -ge 1024 -and $n -le 65535) { return $n }
+        Write-Warn2 'Enter a number between 1024 and 65535.'
+    }
+}
+
+function Get-ExistingSetting([string]$game, [string]$key) {
+    $cfg = Join-Path $game "BepInEx\config\$ModGuid.cfg"
+    if (-not (Test-Path $cfg)) { return $null }
+    $m = [regex]::Match((Get-Content -LiteralPath $cfg -Raw), "(?m)^$([regex]::Escape($key)) = ([^\r\n]*)")
+    if ($m.Success) { return (ConvertFrom-CfgString $m.Groups[1].Value.Trim()) }
     return $null
 }
 
 function Install-BepInEx([string]$game) {
     $core = Join-Path $game 'BepInEx\core\BepInEx.dll'
-    if ((Test-Path $core) -and (Test-Path (Join-Path $game 'winhttp.dll'))) {
+    if ((Test-Path $core) -and (Test-Path (Join-Path $game 'winhttp.dll')) -and (Test-Path (Join-Path $game 'doorstop_config.ini'))) {
         Write-Ok "BepInEx already installed."
         return
     }
@@ -136,19 +389,14 @@ try {
     Write-Host '   Peer-to-peer co-op over Tailscale / LAN / IP' -ForegroundColor Magenta
     Write-Host '  ===============================================' -ForegroundColor Magenta
 
-    # ---------------------------------------------------------------- locate game
-    Write-Step 'Looking for Volcanoids'
-    if (-not (Test-GameDir $GamePath)) { $GamePath = Find-Game }
-    while (-not (Test-GameDir $GamePath)) {
-        Write-Warn2 'Could not find Volcanoids automatically.'
-        Write-Host  '    Install it from Steam first, then paste the game folder here'
-        Write-Host  '    (Steam > right-click Volcanoids > Manage > Browse local files, copy the address bar).'
-        $GamePath = (Read-Host '    Game folder (or leave empty to quit)').Trim().Trim('"')
-        if ([string]::IsNullOrWhiteSpace($GamePath)) { throw 'Volcanoids folder not provided.' }
-    }
-    Write-Ok "Found: $GamePath"
+    # ---------------------------------------------------------------- 1. game folder
+    Write-Step 'Step 1/6 - Where is Volcanoids installed?'
+    $GamePath = Select-GameDir $GamePath
+    Save-GamePath $GamePath
+    Write-Ok "Using: $GamePath"
 
     $pluginDir = Join-Path $GamePath "BepInEx\plugins\$ModName"
+    $outDll = Join-Path $pluginDir "$ModName.dll"
 
     if (Get-Process -Name 'Volcanoids' -ErrorAction SilentlyContinue) {
         throw 'Volcanoids is running. Close the game, then run setup again.'
@@ -164,14 +412,14 @@ try {
         return
     }
 
-    # ---------------------------------------------------------------- BepInEx
-    Write-Step 'Installing BepInEx (mod loader)'
+    # ---------------------------------------------------------------- 2. BepInEx
+    Write-Step 'Step 2/6 - Installing BepInEx (the mod loader)'
     Install-BepInEx $GamePath
+    Enable-Doorstop $GamePath
     Set-BepInExConsole $GamePath
 
-    # ---------------------------------------------------------------- build
-    Write-Step 'Building the mod against your copy of the game'
-    $outDll = Join-Path $pluginDir "$ModName.dll"
+    # ---------------------------------------------------------------- 3. build + install mod
+    Write-Step 'Step 3/6 - Building the mod against your copy of the game'
     $tmpDll = Join-Path $env:TEMP "$ModName.build.dll"
     $built = $false
     try {
@@ -193,30 +441,68 @@ try {
         Write-Warn2 "Installed the PREBUILT dll instead (may not match your game version exactly)."
     }
 
-    # ---------------------------------------------------------------- firewall
-    Write-Step 'Windows Firewall (needed only on the computer that HOSTS)'
-    $ans = Read-Host "    Allow incoming connections on TCP port $DefaultPort? This asks for admin. [Y/n]"
-    if ($ans -notmatch '^[nN]') { Add-FirewallRule $DefaultPort } else { Write-Warn2 'Skipped.' }
+    # ---------------------------------------------------------------- 4. settings
+    Write-Step 'Step 4/6 - Settings (just press ENTER to keep the defaults)'
+    $port = $DefaultPort
+    $existingPort = Get-ExistingSetting $GamePath 'Port'
+    if ($existingPort -match '^\d+$') { $port = [int]$existingPort }
+    $port = Read-Port $port
 
-    # ---------------------------------------------------------------- done
-    Write-Step 'Done!'
+    $password = Get-ExistingSetting $GamePath 'Password'
+    if ($null -eq $password) { $password = '' }
+    $pwState = 'none'
+    if ($password.Length -gt 0) { $pwState = 'one is set' }
+    Write-Host "    Optional password - host and friends must type the same one (currently: $pwState)."
+    $pwAnswer = Read-Host '    Password [ENTER = keep, - = remove]'
+    if ($pwAnswer -eq '-') { $password = '' }
+    elseif (-not [string]::IsNullOrEmpty($pwAnswer)) { $password = $pwAnswer }
+
+    $playerName = Get-ExistingSetting $GamePath 'PlayerName'
+    if ([string]::IsNullOrEmpty($playerName)) { $playerName = $env:USERNAME }
+    $nameAnswer = Read-Host "    Your name shown to the host [ENTER = $playerName]"
+    if (-not [string]::IsNullOrWhiteSpace($nameAnswer)) { $playerName = $nameAnswer.Trim() }
+
+    Write-ModConfig $GamePath $port $password $playerName
+
+    # ---------------------------------------------------------------- 5. firewall
+    Write-Step 'Step 5/6 - Windows Firewall (only needed on the computer that HOSTS)'
+    $ans = Read-Host "    Allow incoming connections on TCP port $port? This asks for admin. [Y/n]"
+    if ($ans -notmatch '^\s*[nN]') { Add-FirewallRule $port } else { Write-Warn2 'Skipped.' }
+
+    # ---------------------------------------------------------------- 6. verify
+    Write-Step 'Step 6/6 - Checking that the game is ready'
+    if (-not (Test-Ready $GamePath $outDll)) {
+        throw 'Something is missing (see the list above). Run setup.bat again; if it keeps failing, send a screenshot of this window.'
+    }
+
+    Write-Host ''
+    Write-Host '    ALL DONE - Volcanoids is ready to play with Direct Connect!' -ForegroundColor Green
     Write-Host @"
 
-    HOW TO PLAY (both players install the mod with this setup):
+    HOW TO PLAY (every player runs this setup once):
 
     1. Both install Tailscale (https://tailscale.com) and log in to the SAME tailnet
-       (or use ZeroTier / Radmin VPN / same LAN / port-forward TCP $DefaultPort).
-    2. HOST: start Volcanoids from Steam, load your save as a co-op/multiplayer game.
-       The direct port opens automatically. Press F8 to see the address to share
+       (or use ZeroTier / Radmin VPN / same LAN / port-forward TCP $port).
+    2. HOST: start Volcanoids from Steam as usual and load your save as a co-op /
+       multiplayer game. Press F8 to see the address to give your friend
        (the 100.x.x.x one is your Tailscale IP).
-    3. JOINER: start Volcanoids, stay on the MAIN MENU, press F8,
-       type the host address (e.g. 100.101.102.103:$DefaultPort) and click Join.
+    3. FRIEND: start Volcanoids, stay on the MAIN MENU, press F8,
+       type the host address (e.g. 100.101.102.103:$port) and click Join.
 
     F8 = Direct Connect window    F9 = write a diagnostics report
+    Settings:    $GamePath\BepInEx\config\$ModGuid.cfg
     Logs:        $GamePath\BepInEx\LogOutput.log
     Diagnostics: $GamePath\BepInEx\VolcanoidsDirectConnect_diagnostics.txt
-    Settings:    $GamePath\BepInEx\config\com.volcanoidsmp.directconnect.cfg (after first launch)
+    A BepInEx console window opens next to the game - that's normal, it shows the mod's log.
 "@
+
+    $launch = Read-Host '    Start Volcanoids now? [y/N]'
+    if ($launch -match '^\s*[yY]') {
+        $appId = Get-SteamAppId $GamePath
+        if ($appId) { Start-Process "steam://rungameid/$appId" }
+        else { Start-Process -FilePath (Join-Path $GamePath 'Volcanoids.exe') -WorkingDirectory $GamePath }
+        Write-Ok 'Launching... (the first start with BepInEx can take a little longer)'
+    }
 }
 catch {
     Write-Host ''

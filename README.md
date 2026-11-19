@@ -6,17 +6,38 @@ A Volcanoids co-op mod (targets game **v1.33.506.0**) that lets players join eac
 
 ## Install (both players)
 
-1. Install Volcanoids from Steam and launch it once, then close it.
-2. Run **`setup.bat`** from this folder. It will:
-   - find your Volcanoids install (or ask you for the folder),
-   - install [BepInEx 5.4.23.6](https://github.com/BepInEx/BepInEx) (the mod loader; it checks the download's SHA-256),
-   - compile the mod against **your** copy of the game and copy it to `BepInEx\plugins\VolcanoidsDirectConnect\`,
-   - optionally add a Windows Firewall rule for TCP port 27777 (only the host needs it).
+1. Install Volcanoids from Steam. Close the game if it's running.
+2. Double-click **`setup.bat`** and answer its questions. Pressing **ENTER** keeps the suggested answer.
 
-Other commands:
+You don't need to download or install anything yourself. Setup does all of this:
 
-- `setup.bat "D:\SteamLibrary\steamapps\common\Volcanoids"` installs into a specific folder.
-- `setup.bat uninstall` removes the mod.
+| Step | What happens |
+|---|---|
+| 1. Game folder | Shows the Volcanoids folder it found (or the one you used last time). Press **ENTER** to accept it, or type, paste or drag in a different folder. |
+| 2. BepInEx | Downloads and installs the [BepInEx 5.4.23.6](https://github.com/BepInEx/BepInEx) mod loader into the game, after checking the download's SHA-256. If BepInEx is already there, it's reused. If its loader was switched off, setup switches it back on. |
+| 3. Mod | Compiles the mod against **your** copy of the game and installs it to `BepInEx\plugins\VolcanoidsDirectConnect\`. |
+| 4. Settings | Asks for the port (default 27777), an optional password and the name the host sees, then writes the settings file. Running setup again keeps your existing answers. |
+| 5. Firewall | Optionally allows the chosen port through Windows Firewall. Only the host needs this. Windows will ask for admin permission. |
+| 6. Check | Confirms every piece is in place, prints `ALL DONE - Volcanoids is ready to play`, and offers to start the game through Steam. |
+
+### Typing the game folder
+
+When setup asks for the folder, you can give it any of these:
+
+- the game folder itself, e.g. `D:\SteamLibrary\steamapps\common\Volcanoids`
+- the path to `Volcanoids.exe` or to the `Volcanoids_Data` folder
+- a Steam library folder, e.g. `D:\SteamLibrary`; setup finds the game inside it
+
+Quotes around the path are fine. You can also drag the folder into the setup window. To find the folder: in Steam, right-click Volcanoids, choose **Manage → Browse local files**, and copy the address bar.
+
+Setup remembers your answer in `gamepath.txt` next to `setup.bat`, so next time you can just press ENTER.
+
+### Other ways to run it
+
+- `setup.bat "D:\SteamLibrary\steamapps\common\Volcanoids"` uses that folder without asking. Dragging the game folder onto `setup.bat` does the same.
+- `setup.bat uninstall` removes the mod and its firewall rule. BepInEx stays installed; setup lists the files to delete if you want it gone too.
+
+When the game starts with the mod, a BepInEx console window opens next to it. That's normal: it shows the mod's log.
 
 ## Play
 
@@ -31,12 +52,13 @@ Other commands:
 
 ## Settings
 
-The settings file is `<game>\BepInEx\config\com.volcanoidsmp.directconnect.cfg`. It appears after the first launch.
+Setup creates the settings file at `<game>\BepInEx\config\com.volcanoidsmp.directconnect.cfg`. To change the port, password or name later, either run `setup.bat` again or edit the file in Notepad while the game is closed.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `Port` | 27777 | TCP port the host listens on |
 | `Password` | *(empty)* | Optional. Must match on both sides |
+| `PlayerName` | your Windows user name | The name the host sees in their log |
 | `AutoOpenWhenHosting` | true | Opens the port as soon as you host |
 | `MaxDirectPlayers` | 3 | Maximum number of direct-IP joiners |
 | `RequireSameGameVersion` | true | Rejects joiners whose game version is different |

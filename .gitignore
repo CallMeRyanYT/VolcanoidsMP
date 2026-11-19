@@ -4,3 +4,4 @@ out/
 *.pdb
 *.user
 .vs/
+gamepath.txt
